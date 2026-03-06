@@ -27,6 +27,10 @@
 			- [Схема DNS балансировки](#схема-dns-балансировки)
 			- [Схема Anycast балансировки](#схема-anycast-балансировки)
 		- [4. Локальная балансировка нагрузки](#4-локальная-балансировка-нагрузки)
+			- [Механизм резервирования](#механизм-резервирования)
+			- [Расчёт количества L7-балансировщиков](#расчёт-количества-l7-балансировщиков)
+			- [Общее количество балансировщиков](#Общее количество балансировщиков)
+			- [Схема балансировки нагрузки](#Схема балансировки нагрузки)
 	- [Список источников](#список-источников)
 
 ---
@@ -170,7 +174,6 @@
 Так же взглянем на распределение населения по регионам:
 ![Распределение населения России](destribution-of-population.png)
 Вырисовывается четкая картина, что чем ближе к центру, тем плотнее население.
-
 Карта магистральных сетей связи также играет большую роль при определении локации для дата-центра. Чтобы уменьшить задержку при использовании сервиса, будем располагать дата-центры вблизи больших магистральных сетей связи.
 ![Западные магистральные сети](magistral-2.png)
 ![Восточные магистральные сети](magistral-1.png)
@@ -199,7 +202,7 @@
 #### Схема DNS балансировки
 
 ```mermaid
-flowchart LR  
+flowchart TD  
 U[Пользовательское приложение]  
 R[Рекурсивный DNS-резолвер<br/>провайдера / ОС]  
 D[Авторитативный DNS<br/>зоны service.ru]  
@@ -222,7 +225,7 @@ LB --> API
 
 #### Схема Anycast балансировки
 ```mermaid
-flowchart LR
+flowchart TD
     U["Пользовательское приложение"]
     N["Сеть оператора / Интернет"]
     A["Anycast IP: 203.0.113.10"]
@@ -240,6 +243,106 @@ flowchart LR
 
 ---
 ###  4. Локальная балансировка нагрузки
+
+#### Механизм резервирования
+Для пула балансировщиков используются две стандартные схемы:
+- $N + 1$:
+    $N_{total}\ =\ N + 1$,
+    где $N$- минимально необходимое число активных балансировщиков.
+- $N\cdot2$:
+    $N_{total}=N\cdot2$
+    Полное дублирование всего рабочего пула.
+
+Для MVP внутри одного дата-центра достаточно схемы $N + 1$. 
+Схема $N\cdot2$ даёт более высокий запас, но для данной нагрузки выглядит избыточной.
+#### Расчёт количества L7-балансировщиков
+
+Пиковое число новых клиентских сессий/запросов синхронизации: **16,722 запросов/с**.
+Пиковый суммарный трафик: **1.2013 Гбит/с**.
+Для оценки берём:
+- **SSL Termination** по консервативному показателю HTTPS CPS = 10,274 подключений/с на узел [^18] (на 24 CPU).
+- **Пропускную способность** по NGINX Ingress throughput = 8.80 Гбит/с на узел [^19] (на 24 CPU). Дополнительно в ingress-тесте зафиксировано до 58,811 SSL TPS [^19] на узел (на 24 CPU), но для sizing ниже берём более жёсткий HTTPS CPS-предел.
+Тогда:
+$$N_{ssl}​=\lceil{\frac{16,722}{10,274}}\rceil​=2$$$$ N_{net}=\lceil{\frac{1.2013}{8.80}}\rceil=1$$
+$$N=max(Nssl​,Nnet​)=max(2,1)=2$$
+Минимально без резерва получается 2 L7-балансировщика.
+Для MVP внутри одного дата-центра достаточно схемы $N + 1$.  
+
+#### Общее количество балансировщиков
+
+Для MVP достаточно следующей локальной схемы:
+
+- **2 L4-балансировщика** по схеме $N + 1 = 1 + 1 = 2$;
+- **3 L7-балансировщика** по схеме $N + 1 = 2 + 1 = 3$; (2 под рабочей нагрузкой + 1 резервный).
+
+#### Схема балансировки нагрузки
+
+Внутри одного московского ДЦ балансировку разумно делать в два слоя:
+1. **L4-слой** - точка входа с общим VIP-адресом.  
+    Резервирование: $1+1$ (два узла, один VIP, health-check/failover).
+2. **L7-слой** - пул SSL балансировщиков (NGINX/Ingress).  
+    Здесь выполняются:
+    - SSL Termination.
+    - Маршрутизация HTTP/WebSocket.
+    - Распределение запросов по доменным сервисам: API/Auth/Message.
+
+```mermaid
+flowchart TD
+C[Клиенты]
+
+subgraph NET[Сетевой слой]
+SW1[Edge / ToR switch A]
+SW2[Edge / ToR switch B]
+VIP[VIP адрес сервиса]
+end
+
+subgraph L4[L4 балансировка]
+L4A[L4 balancer A]
+L4B[L4 balancer B<br/>резерв]
+end
+
+subgraph L7[L7 балансировка]
+L7A[L7 balancer A]
+L7B[L7 balancer B]
+L7C[L7 balancer C<br/>резерв]
+end
+
+subgraph APP[Прикладной слой]
+API[API / Gateway / WebSocket]
+AUTH[Auth]
+MSG[Message service]
+end
+
+subgraph DATA[Хранение]
+DB[(DB / Storage)]
+end
+
+C --> SW1
+C --> SW2
+
+SW1 --> VIP
+SW2 --> VIP
+
+VIP --> L4A
+VIP -. резерв .-> L4B
+
+L4A --> L7A
+L4A --> L7B
+L4A -. резерв .-> L7C
+
+L4B --> L7A
+L4B --> L7B
+L4B -. резерв .-> L7C
+
+L7A --> API
+L7B --> API
+L7C --> API
+
+API --> AUTH
+API --> MSG
+MSG --> DB
+```
+
 
 ---
 ## Список источников
@@ -263,7 +366,6 @@ flowchart LR
 [^9]: [UTF-8](https://en.wikipedia.org/wiki/UTF-8)
 
 [^10]: [Number of WhatsApp Business daily active users (DAU) worldwide from 1st quarter 2019 to 3rd quarter 2025](https://www.statista.com/statistics/1538345/whatsapp-business-dau-worldwide/)
-
 [^11]: [How WhatsApp Handles 40 Billion Messages Per Day](https://blog.bytebytego.com/p/how-whatsapp-handles-40-billion-messages#:~:text=WhatsApp%20is%20one%20of%20them%2E%20It%20moves%20nearly%2040%20billion%20messages%20daily)
 
 [^12]: [В Mediascope отметили, что россияне тратят около 30% времени в Telegram на чтение каналов](https://tass.ru/obschestvo/19286563)
@@ -278,3 +380,6 @@ flowchart LR
 
 [^17]: [Пинг из Москвы](netpoint-dc.com/blog/wp-content/uploads/2018/09/NetPoint-Russia.pdf)
 
+[^18]: [Testing the Performance of NGINX and NGINX Plus Web Servers](https://blog.nginx.org/blog/testing-the-performance-of-nginx-and-nginx-plus-web-servers)
+
+[^19]: [https://blog.nginx.org/blog/testing-performance-nginx-ingress-controller-kubernetes](https://blog.nginx.org/blog/testing-performance-nginx-ingress-controller-kubernetes)
